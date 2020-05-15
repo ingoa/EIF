@@ -1,0 +1,31 @@
+
+CC=gcc
+CC=cc
+
+CFLAGS = -ansi   # gcc CFLAGS
+CFLAGS = -Ae     # HP C compiler CFLAGS
+
+LDFLAGS = -L. -lteceif
+
+# use tlieif.c for an operating system (System V R4) with TLI
+IPC_SRC = tlieif.c
+# use sockeif.c for an operating system with sockets
+IPC_SRC = sockeif.c
+
+SRCS = agent_comm.c agent_util.c slist.c evt_buffer.c $(IPC_SRC)
+OBJS = $(SRCS:%.c=%.o)
+
+EIF_LIB = libteceif.a
+
+TEST_EXE = agent
+
+all: $(EIF_LIB) $(TEST_EXE)
+
+$(EIF_LIB): $(OBJS)
+	ar cvq $@ $^
+
+$(TEST_EXE): agent.o $(EIF_LIB)
+	cc -o $(TEST_EXE) agent.o $(LDFLAGS)
+
+clean:
+	/bin/rm -f $(EIF_LIB) $(TEST_EXE) $(OBJS)
