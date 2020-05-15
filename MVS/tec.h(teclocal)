@@ -1,0 +1,71 @@
+/*
+ * Component Name: EIF
+ *
+ * Dependencies:
+ *
+ * $Date: 1995/03/02 03:05:51 $
+ *
+ * $Source: /tivoli/development/src/2.0/apps/tec/eif/tec_local.h,v $
+ *
+ * $Revision: 1.3 $
+ *
+ *
+ * (C) COPYRIGHT TIVOLI Systems, Inc. 1994
+ * Unpublished Work
+ * All Rights Reserved
+ * Licensed Material - Property of TIVOLI Systems, Inc.
+ */
+ 
+#if !defined(EXTERN_DECL)
+#       if defined(__cplusplus)
+#       define EXTERN_DECL(entry, args) extern "C" entry args
+#       define VOID_DECL void
+#       elif defined(__STDC__)
+#       define EXTERN_DECL(entry, args) extern entry args
+#       define VOID_DECL void
+#       else
+#       if !defined(const)
+#               define const
+#       endif
+#       define EXTERN_DECL(entry, args) extern entry()
+#       define VOID_DECL
+#       endif
+#endif
+ 
+#ifndef __SASC__
+#include <netinet/in.h>
+#else
+#include <inet.h>
+#endif
+#ifdef AIX    /* the AIX rpc stuff are wrapped by #ifdef _SUN */
+#define _SUN
+#include <netdb.h>
+#undef _SUN
+#else
+#include <netdb.h>
+#endif
+#ifdef SVR4
+#ifndef DGUX
+#include <rpc/rpcent.h>   /* for RPC definitions on svr4 */
+#endif
+#endif
+ 
+#include <stdlib.h>
+ 
+#define AGENT_PREFIX            "agent"
+#define TME_AGENT_PREFIX        "tme_agent"
+#define CONNECTIONLESS_AGENT_PREFIX     "conn_agent"
+ 
+#define MAX_PENDING             5
+ 
+#define TEC_SERVER_NAME         "tec_server"
+#define TEC_SERVER_NUMBER       100033057
+#define TEC_VERSION_NUMBER      1
+ 
+#ifndef __SASC__
+u_short pmap_getport();
+short pmap_set();
+short pmap_unset();
+#endif
+ 
+ 

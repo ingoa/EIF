@@ -1,0 +1,67 @@
+#ifndef agent_comm_h
+#define agent_comm_h
+ 
+/*
+ * Component Name:  EIF
+ *
+ * Dependencies:
+ *
+ * $Date: 1995/03/09 08:13:53 $
+ *
+ * $Source: /tivoli/development/src/2.0/apps/tec/eif/agent_comm.h,v $
+ *
+ * $Revision: 1.6 $
+ *
+ * Description:
+ *        header file for TME agents
+ *
+ * (C) COPYRIGHT TIVOLI Systems, Inc. 1994
+ * Unpublished Work
+ * All Rights Reserved
+ * Licensed Material - Property of TIVOLI Systems, Inc.
+ */
+ 
+#include <sys/time.h>
+ 
+#define FILTER "Filter:"
+#define TECAD_EVENT_DELIMITER   "END\n\001"
+ 
+#if !defined(EXTERN_DECL)
+#       if defined(__cplusplus)
+#       define EXTERN_DECL(entry, args) extern "C" entry args
+#       define VOID_DECL void
+#       elif defined(__STDC__)
+#       define EXTERN_DECL(entry, args) extern entry args
+#       define VOID_DECL void
+#       else
+#       if !defined(const)
+#               define const
+#       endif
+#       define EXTERN_DECL(entry, args) extern entry()
+#       define VOID_DECL
+#       endif
+#endif
+ 
+#ifndef CODE_ID
+#define CODE_ID(id)\
+        static char *_code_id(char *s) { return _code_id(s=id); }
+#endif
+ 
+ 
+ 
+typedef enum { connection_less, \
+              connection_oriented, use_default } tec_delivery;
+typedef void *THND_t;
+ 
+extern int tec_errno;
+ 
+THND_t tec_create_handle();
+long tec_put_event();
+int tec_buffer_event();
+int tec_flush_events();
+void tec_destroy_handle( );
+int TAG_init();
+char *TAG_getenv();
+ 
+#define FILE_LEN 256
+#endif /* def agent_comm_h */

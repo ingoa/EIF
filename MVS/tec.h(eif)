@@ -1,0 +1,64 @@
+#ifndef eif_h
+#define eif_h
+ 
+/*
+ * Component Name: EIF
+ *
+ * $Date: 1995/01/12 05:05:54 $
+ *
+ * $Source: /tivoli/development/src/2.0/apps/tec/eif/eif.h,v $
+ *
+ * $Revision: 1.2 $
+ *
+ * Description:
+ *      common functions for TME and non-TME agent libraries
+ *
+ * (C) COPYRIGHT TIVOLI Systems, Inc. 1994
+ * Unpublished Work
+ * All Rights Reserved
+ * Licensed Material - Property of TIVOLI Systems, Inc.
+ */
+ 
+/* $Id: eif.h,v 1.2 1995/01/12 05:05:54 crow Exp $ */
+ 
+#define E_RESERVED 21
+ 
+#define E_BAD_HANDLE    (E_RESERVED+8)  /* bad handle specified */
+#define E_SCALL         (E_RESERVED+17) /* system call failed */
+#define E_IPC_BROKEN    (E_RESERVED+46) /* IPC shutdown */
+#define E_IPC_CORRUPT   (E_RESERVED+52) /* IPC message corrupted */
+#define E_HOST          (E_RESERVED+27) /* host inaccessible or */
+ 
+#ifndef TRUE
+#define TRUE 1
+#endif
+#ifndef FALSE
+#define FALSE 0
+#endif
+ 
+typedef struct IPCHSTRU { /* ipc_handle structure declaration */
+    int fd;
+} IPCH_t, *IPCH_p_t;
+ 
+ 
+typedef int ipc_error_t;
+ 
+#define HDR_DATA_LEN 2000
+#define TOKEN "<START>>"
+ 
+typedef struct IMHSTRUC {  /* ipc_msg_hdr structure decl */
+    char     token[8];
+    unsigned msg_id;
+    unsigned msg_from;
+    unsigned msg_to;
+    unsigned msg_type;
+    unsigned ipc_msg_type;
+    unsigned msg_len;
+    unsigned hdr_dlen;   /* Header data length */
+    char     hdr_data[HDR_DATA_LEN];
+} IMH_t, *IMH_p_t;
+ 
+ 
+#endif  /* eif_h */
+ 
+ 
