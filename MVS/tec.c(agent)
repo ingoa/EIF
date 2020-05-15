@@ -1,0 +1,2828 @@
+/*
+ * Component Name: MVS T/EC Logfile Adapter
+ *
+ * From the TEC agent communication library
+ * for non-TME agents.
+ *
+ * This code also contains a port of the EIF
+ * libraries for MVS equipped with TCP/IP
+ *
+ * (C) COPYRIGHT TIVOLI Systems, Inc. 1994
+ * Unpublished Work
+ * All Rights Reserved
+ * Licensed Material - Property of TIVOLI Systems, Inc.
+ */
+ 
+int Debug = 0;
+ 
+#ifdef __SASC__
+  /* Disable proto use in hdr files, just std K&R func. decl. */
+#define NOSLIBCK
+#endif
+ 
+#include <stdlib.h>
+#include <stdio.h>
+#include <ctype.h>
+#include <errno.h>
+#include <string.h>
+ 
+#ifndef __SASC__
+#include <sys/types.h>
+#endif
+ 
+#include <sys/time.h>
+#include <sys/signal.h>
+#include <sys/socket.h>
+ 
+#ifdef __SASC__
+#include <sys/xdrtypes.h>
+#include <sys/pmapclnt.h>
+#include <netdb.h>
+#endif
+ 
+ 
+#ifndef __SASC__
+#include <manifest.h>
+#include "'AATM.EIF.SOURCE.agtcomm.h'"
+#include "'AATM.EIF.SOURCE.eif.h'"
+#include "'AATM.EIF.SOURCE.slist.h'"
+#include "'AATM.EIF.SOURCE.teclocal.h'"
+#else
+ 
+#include "agtcomm.LOCALH"
+#include "eif.LOCALH"
+#include "slist.LOCALH"
+#include "teclocal.LOCALH"
+#endif
+ 
+#ifdef __SASC__
+typedef unsigned short    ushort;
+typedef unsigned long     ulong;
+#endif
+ 
+#ifdef __SASC__
+typedef struct _MsgClsDef {
+    char              *MsgStr;
+    int                MsgLen;
+    char              *Severity;
+    char              *Class;
+    struct _MsgClsDef *Next;
+} MsgClsDef;
+ 
+MsgClsDef *MsgCls = NULL;
+ 
+ 
+#endif
+ 
+/* generic MVS does not support sleep() (SAS/C does) */
+/* or alarm() or even select()          */
+/* so we have to system("wait nn") to   */
+/* force a sleep()                      */
+ 
+/* the CONFIGFILE is specified as an    */
+/* MVS DD (data definition - something  */
+/* like an shell variable only more so  */
+ 
+/* The DEFAULT_EVENTFILE would be changed */
+/* in the CONFIGFILE to point to the file */
+/* containing the system message.         */
+ 
+#define  DEFAULT_SLEEP_INTERVAL         (300)
+#ifndef __SASC__
+#define  SLEEP_INTERVAL         "wait 300"
+#define  CONFIGFILE             "dd:TECDD"
+#define  DEFAULT_EVENTFILE      "AATM.EIF.SOURCE.HOST.LOG"
+#else
+#define  SLEEP_INTERVAL         (300)
+               /*  Note FILE references in SAS/C are always via
+                *  DDNames */
+#define  CONFIGFILE             "CONFIG"
+#define  DEFAULT_EVENTFILE      "LOG"
+#endif
+#define  DEFAULT_LOCATION       "@tec_server"
+ 
+/* Following are the definitions of the strings */
+/* we look for in the logfile.  MVS_POOLSTATUS  */
+/* is not going to be supported at this time    */
+#define  MVS_TASK_UP            "IEF403I"
+#define  MVS_TASK_DOWN          "IEF404I"
+#define  MVS_TASK_FAILED        "IEF450I"
+#define  MVS_POOL_STATUS        "IEF0000"
+ 
+                                /* global options        */
+int             one_way = 0;
+int             connectionless = 0;
+int             port = 0;
+tec_delivery    type = use_default;
+char           *location = NULL;
+char            event_file[128];
+char            MsgHostname[128];
+char           *MsgHostip;
+extern int      tec_errno;
+ 
+static char     s[4096];
+int             ForceBuffering = 0;
+ 
+char *strdup();
+int FindStr();
+#define SEVERITY ";severity="
+#define MSGFIELD ";msg="
+ 
+/*
+ *---------------------------------------------------
+ *
+ * Main body of code:  open the configuration file
+ * determine what log file to read, and start sending
+ * events after initializing the communications
+ *
+ *---------------------------------------------------
+ */
+main(argc, argv)
+    int             argc;
+    char           *argv[];
+{
+ 
+    THND_t          th;              /* create TEC handle        */
+    char       cfg_file_name[200];   /* path to config file */
+    char           *cfg_file = NULL; /* ptr to config file path */
+    char           *efile;           /* pointer to the event file*/
+    int             h_id;
+    int             tpestat;
+    int             n;
+    char           *evt_file = NULL; /* ptr to evt file path */
+#ifdef __SASC__
+    char           *cfp = NULL;
+    int c;
+    extern int      optind;
+    extern char    *optarg;
+    char           *severity = NULL;
+    char           *tecmsg   = NULL;
+ 
+    int             FlushOnly = 0;
+ 
+    int             oneway = 0;
+/*  struct          stat   sbuf; */
+    int             rc;
+ 
+    char            PartBuf[1024];
+    int             PollTime = DEFAULT_SLEEP_INTERVAL;
+ 
+    void print_usage_and_exit();
+#endif
+ 
+#ifndef __SASC__
+    char            SleepCmd[50];
+#endif
+ 
+    /* Init array */
+    memset(cfg_file_name, '\0', sizeof(cfg_file_name));
+ 
+ 
+#ifndef __SASC__
+ 
+/* skip option processing...  It seems that              */
+/* MVS does not support the getopt() functionality       */
+/*                                                       */
+/* instead (for now) just take                           */
+/* argv[1] as the config_file                            */
+ 
+    cfg_file = cfg_file_name;
+    strcpy( cfg_file,CONFIGFILE );      /* default */
+    if (argc > 1) {
+        strcpy( cfg_file,argv[1]);
+    }
+ 
+#else
+ 
+    memset(s, '\0', sizeof(s)); /* Make sure init. for later test */
+ 
+            /* Flags in upper case since TSO CALL command passes
+             * all arguments in upper case */
+    while ((c = getopt(argc, argv, "S:CcL:P:D:fFR:M:E:")) != -1) {
+        switch (c) {
+            case 'L':
+            /* Specifies location of the agent configuration file */
+                strcpy(cfg_file_name, optarg);
+                cfg_file = cfg_file_name;
+                break;
+            case 'E':
+                /* Specifies that event will be read from file */
+                evt_file = strdup(optarg);
+                break;
+            case 'P':
+                    /* Specifies the port to connect to on the Server */
+                if (!isdigit(*optarg)) {
+                    print_usage_and_exit(argv);
+                }
+                port = atol(optarg);
+                break;
+            case 'C':
+                oneway++;
+            case 'c':
+                connectionless++;
+                type = connection_less;
+                break;
+            case 'S':
+                location = strdup(optarg);
+                break;
+            case 'R':
+                severity = strdup(optarg);
+                break;
+            case 'M':
+                tecmsg = strdup(optarg);
+                break;
+            case 'D':
+                Debug = atoi(optarg);
+                break;
+            case 'f':
+                ForceBuffering = 1;
+                break;
+            case 'F':
+                FlushOnly = 1;
+                break;
+            default:
+                print_usage_and_exit(argv);
+                break;
+        }
+    }
+ 
+    if (Debug >= 1)
+    {
+       char *cp =  argv[0];
+       printf("main(): argc=%d\n", argc);
+       for (n=0; n < argc; n++, cp = argv[n]) {
+           printf ("   %d : %s \n", n, cp);
+       } 
+    }
+ 
+    if (evt_file != NULL) {
+       /* A format event has been passed in, handle in a modified
+       /* postemsg format */
+       if (Debug) {
+          fprintf(stdout, "Process event file: %s\n", evt_file);
+       } 
+       ProcSingleEvt(evt_file, severity, tecmsg, s);
+       if (s[0] == '\0') {
+           printf("File: %s contained no data\n", evt_file);
+           exit(1);
+       } 
+    }
+    else if (optind == argc) {
+       /* No more args; skip the rest of the if-then-else
+       /* and go on to prompt user for input */
+    }
+    else if (optind + 1 == argc) {
+       /* Only one more arg that is not a flag, we need at least 2, the
+       /* class and source for the T/EC msg; print usage and exit */
+       print_usage_and_exit(argv);
+       exit(2);
+    }
+    else {
+       /* Handle the command like a wpostemsg */
+       int  numslots = argc - 2; /* disallow the last 2 fields on the
+                                  * cmdline*/
+ 
+       memset(s, '\0', sizeof(s)); /* Make sure no extraneous
+                                   /* vals are being picked up */
+       strcpy(s, argv[argc-2]);
+       sprintf(PartBuf, ";source=%s", argv[argc-1]);
+       strcat(s, PartBuf);
+ 
+       if (severity != NULL) {
+          sprintf(PartBuf, "%s%s", SEVERITY, severity);
+          strcat(s, PartBuf);
+       } 
+       if (tecmsg != NULL) {
+          sprintf(PartBuf, ";msg='%s'", tecmsg);
+          strcat(s, PartBuf);
+       } 
+       for (; optind < numslots; optind++)
+       { 
+           strcat(s, ";");
+           strcat(s, argv[optind]);
+       } 
+ 
+       if (Debug >= 1) {
+          fprintf(stdout, "main(): Built msg '%s'\n", s);
+          fflush(stdout);
+       } 
+    }
+#endif
+ 
+    memset(MsgHostname, '\0', sizeof(MsgHostname));
+    if ( gethostname( MsgHostname, 128 ) != 0 ){
+        perror( "gethostname" );
+    }
+    if (Debug >= 3) {
+       printf("main(): gethostname=%s (Len=%d)\n",
+             MsgHostname, strlen(MsgHostname));
+    }
+ 
+#ifndef __SASC__
+    if ( gethostname( MsgHostname, 128 ) != 0 ){
+        perror( "gethostname" );
+        exit( 1 );
+    }
+ 
+    if ( (h_id = gethostid()) == 0 ){
+        perror( "gethostid" );
+        exit( 1 );
+    } else{
+	       struct in_addr in;
+	       (void) memcpy(&in.s_addr, &h_id, sizeof (in.s_addr));
+	       MsgHostip = (char *)inet_ntoa( h_id );
+    }
+#endif
+ 
+    /* KISS:  open the tec and send any new events   */
+ 
+    if (Debug >= 1) {
+       printf("main(): call TAG_init, cfg_file=%s\n",
+              cfg_file == NULL ? "<NULL>" : cfg_file);
+    }
+    if (TAG_init(cfg_file) != 0) {
+        printf("Error in TAG_init(Conf File=%s)\n",
+               cfg_file == NULL ? "<Default>" : cfg_file);
+        exit( 1 );
+    }
+    /*
+     *  Let the configuration file override the system name
+     */
+    cfp = TAG_getenv("HostName");
+    if (cfp != NULL) {
+       strcpy(MsgHostname, cfp);
+    }
+#ifdef __SASC__
+    if (Debug >= 99) {  /* Send Multiple Events Through */
+       StressIt();
+    }
+ 
+    /* Postemsg variation used, post msg and exit */
+    if ( *s != '\0' ) {
+       tpestat = PostMsg();
+       exit (tpestat);
+    }
+#endif
+    if ((efile=TAG_getenv("EventFile")) == NULL) {
+        strcpy( event_file, DEFAULT_EVENTFILE);
+    } else
+        strcpy( event_file, efile );
+ 
+ 
+    if ((efile=TAG_getenv("PollInterval")) == NULL) {
+        PollTime = DEFAULT_SLEEP_INTERVAL;
+    } else
+        PollTime = atoi(efile);
+ 
+    if (Debug >= 1) {
+       printf("main(): Start Loop, PollTime = %d\n", PollTime);
+    }
+ 
+#ifndef __SASC__
+   sprintf(SleepCmd, "sleep %d", PollTime);
+#endif
+    while (1)
+    {
+ 
+        if ((th = tec_create_handle(location, port,
+                        one_way, use_default )) == NULL) {
+            printf("Failure: tec_create_handle(%s,%d,%d, type))\n",
+                   location, port, one_way);
+            printf( "tec_errno:%d\n", tec_errno);
+            break;
+        }
+ 
+    /* Get the events that have not been sent yet and send       */
+    /* them on to the TEC server                                 */
+ 
+ 
+#ifdef __SASC__
+        ProcSprintEvtFile(th, event_file);
+#else
+        proc_event_file(th, event_file);
+#endif
+ 
+        tec_destroy_handle(th);
+ 
+        if (Debug >= 2) {
+           printf("main(): After process event file, sleeping\n");
+        }
+ 
+#ifndef __SASC__
+        system( SleepCmd );
+#else
+        sleep( PollTime );
+#endif
+ 
+    }
+}
+ 
+int
+ProcSingleEvt (char *EvtFileName, char *Severity, char *Msg,
+               char *EvtOutput)
+{
+    FILE *fp;
+    char *bp;
+    char  Buf1[4096];
+    char  Evt1[4096];
+    char  Evt2[4096];
+    int   LenEvt1;
+    char *cp;
+    int   i;
+ 
+    if (Debug) {
+       fprintf(stdout, "ProcSingleEvt(): Start\n");
+    }
+ 
+    fp = fopen(EvtFileName, "r");
+    if ( fp == NULL) {
+       return (-1);
+    }
+    memset(Evt1, '\0', sizeof(Evt1));
+    bp = fgets(Buf1, sizeof(Buf1) - 1, fp);
+    while (bp != NULL) {
+       if (Debug) {
+          fprintf(stdout, "ProcSingleEvt(): bp=%s\n", bp);
+       } 
+ 
+       strcat(Evt1, bp);
+       bp = fgets(Buf1, sizeof(Buf1) - 1, fp);
+    }
+    fclose(fp);
+    if (Debug) {
+       printf("File Contents: %s\n", Evt1);
+    }
+ 
+    /* Truncate white space */
+    LenEvt1 = strlen(Evt1);
+    cp = &(Evt1[LenEvt1 - 1]);
+    for ( ; isspace(*cp) && cp >= Evt1 ; cp--) {
+       *cp = '\0';
+    }
+    LenEvt1 = strlen(Evt1);
+    cp = &(Evt1[LenEvt1 - 1]);
+    if (*cp == ';') {
+       *cp = '\0'; /* end_msg will add the last semicolon */
+    }
+    if (Debug) {
+       printf("Cleaned up: %s\n", Evt1);
+    }
+ 
+    if (Severity != NULL) {
+       int fndstat;
+       fndstat = FindStr(Evt1, SEVERITY);
+       if (!fndstat) {
+          strcat(Evt1, SEVERITY);
+          strcat(Evt1, Severity);
+       } 
+    }
+ 
+    if (Msg  != NULL) {
+       int fndstat;
+       fndstat = FindStr(Evt1, MSGFIELD);
+       if (!fndstat) {
+          strcat(Evt1, MSGFIELD);
+          strcat(Evt1, Msg);
+       } 
+    }
+ 
+    /* Got the contents of the file, now format it and send to T/EC */
+    strcpy(EvtOutput, Evt1);
+ 
+    return(0);
+#if 1 == 0
+       /* Handle the command like a wpostemsg */
+       int  numslots = argc - 2; /* disallow the last 2 fields on the
+                                  * cmdline*/
+ 
+       memset(s, '\0', sizeof(s)); /* Make sure no extraneous
+                                   /* vals are being picked up */
+       strcpy(s, argv[argc-2]);
+       sprintf(PartBuf, ";source=%s", argv[argc-1]);
+       strcat(s, PartBuf);
+ 
+       if (severity != NULL) {
+          sprintf(PartBuf, ";severity=%s", severity);
+          strcat(s, PartBuf);
+       } 
+       if (tecmsg != NULL) {
+          sprintf(PartBuf, ";msg='%s'", tecmsg);
+          strcat(s, PartBuf);
+       } 
+       for (; optind < numslots; optind++)
+       { 
+           strcat(s, ";");
+           strcat(s, argv[optind]);
+       } 
+ 
+       if (Debug >= 1) {
+          fprintf(stdout, "main(): Built msg '%s'\n", s);
+          fflush(stdout);
+       } 
+    }
+#endif
+}
+ 
+ 
+/*
+ * ----------------------------------------
+ * Code to actually process the logfile.
+ *
+ */
+ 
+ 
+proc_event_file(handle, fname)
+    THND_t          handle;
+    char           *fname;
+{
+    FILE           *fp;
+    char            ibuffer[1024];      /* actual message from file */
+                                        /*  goes here               */
+    char            obuffer[1024];      /* event string sent to     */
+                                        /* T/EC                     */
+    static char     last_date[7];       /* date of last event sent  */
+                                        /* (from log)               */
+    static char     last_time[15];      /* time of last event sent  */
+                                        /* (from log)               */
+    static int      first_time = 1;
+    static char     hostid[120];
+    static char   * event_strings[] = {  "MVS_Task_Up",
+                                         "MVS_Task_Down",
+                                         "MVS_Task_Failed",
+                                         "MVS_Pool_Status",
+                                         "MVS_Other"
+                                       };
+    static char   * possible_msg_id[]={
+                        MVS_TASK_UP,    /* UP          */
+                        MVS_TASK_DOWN,  /* DOWN        */
+                        MVS_TASK_FAILED,/* FAILED      */
+                        MVS_POOL_STATUS,/* Pool Status */
+                        "N/A"           /* Other       */
+                                      };
+ 
+ 
+    /* fields from the message that will be used by T/EC            */
+ 
+    char            host_id[20];/* host name                        */
+    char            cpu_id[9];  /* cpu_id field from log file       */
+    char            date[6];    /* raw date and time string         */
+    char            time[12];   /* raw date and time string         */
+    char            msg_id[8];  /* 7 character message ID           */
+    char            jobnumber[8];  /* 7 character message ID        */
+    char            jobname[20]; /* application id?                  */
+    char            event[128];  /* text of message to be passed on  */
+    char          * cptr;
+ 
+    int             rval;
+    int             msg_index;
+ 
+    if (Debug >= 5) {
+       printf("proc_event_file(): fname=%s\n", fname);
+    }
+ 
+    if ( first_time ){
+        strcpy( last_date, "000000" );
+        strcpy( last_time, "00:00:00.00" );
+        if ( gethostname( hostid, 128 ) == -1 )
+            strcpy( host_id, "UNKNOWN Host!" );
+        first_time=0;
+    }
+ 
+    memset(date, '\0', 6 );
+    memset(time, '\0', 12);
+ 
+    /* attempt to open the file      */
+    if ((fp = fopen(fname, "r")) != NULL)
+    {
+        while (fgets(ibuffer, 1024, fp) != NULL)
+        {
+            if (Debug > 5) {
+               printf("proc_event_file(): entry='%s'\n", ibuffer);
+            }
+ 
+            /* clear out all carriage returns */
+            for (cptr=ibuffer;*cptr!='\0';cptr++)
+                if (*cptr == '\n') *cptr=' ';
+ 
+            memcpy(date, (ibuffer+19), 5);
+            memcpy(time, (ibuffer+25), 11);
+ 
+            /* check and see if there is anything in the
+             * file that is later than the last time we ran.
+             */
+ 
+            if ((rval = strcmp(date, last_date)) >= 0)
+            {
+                if ( (rval==0) && (strcmp(time, last_time) <= 0))
+                    continue;
+ 
+                /* at this point (except for year 2000) we should be */
+                /* past the point where old messages are             */
+                /*                                                   */
+                /* send all new messages                             */
+ 
+ 
+                memcpy( cpu_id, ibuffer+10, 8 ); *(cpu_id+8)='\0';
+                memcpy( jobnumber, ibuffer+37, 8 );
+                    *(jobnumber+7)='\0';
+                memcpy( msg_id, ibuffer+56, 8 ); *(msg_id+7)='\0';
+                strncpy( event, ibuffer+64, 128);
+                sscanf( event, "%s %*s", jobname );
+                strcpy( last_date, date );
+                strcpy( last_time, time );
+                for (msg_index=0;
+                     msg_index<4 &&
+                     strcmp( msg_id, possible_msg_id[msg_index])!=0;
+                     msg_index ++ );
+ 
+ 
+sprintf( obuffer,
+"%s;\n\tsource='MVS';\n\tcpu_id='%s';\n\tjobnum='%d';\n\tdate='%s %s'",
+                event_strings[msg_index], cpu_id, jobnumber,
+                date, time);
+ 
+                strcat( obuffer, ";\n\tmsg_id='" );
+                strcat( obuffer, msg_id );
+                strcat( obuffer, "';\n\tjobname='" );
+                strcat( obuffer, jobname );
+                strcat( obuffer, "';\n\tmsg='" );
+                strcat( obuffer, event );
+                strcat( obuffer, "';\n\thostname='" );
+                strcat( obuffer, MsgHostname );
+                strcat( obuffer, "';\n\torigin='" );
+                strcat( obuffer, MsgHostip );
+                strcat( obuffer, "';\nEND;\n\001" );
+ 
+                rval=tec_put_event( handle, obuffer );
+            }
+        }
+        fclose(fp);
+        return( 0 );
+    }
+    else 
+        fprintf( stderr, "Couldn't open file %s\n", fname );
+    return( 1 );
+}
+ 
+ 
+ 
+ 
+/*
+ * ----------------------------------------
+ * Code to actually process the logfile.
+ *
+ */
+ 
+#define MAX_LINEBUF (20)
+char  InternalBuf[MAX_LINEBUF][1024];
+int   BufCt = 0;
+ 
+BuildBuf(char *fname)
+{
+    char           *bp;
+    char           *cptr;
+    FILE           *fp;
+ 
+    BufCt = 0;
+    /* attempt to open the file      */
+    if ((fp = fopen(fname, "r")) != NULL)
+    {
+        static int lastplace = 0;
+        static int firstpass = 1;
+        static int oldlast   = 0;
+ 
+        if (firstpass) {
+           char  *env;
+           int    StrtAtEnd = FALSE;
+ 
+           env = TAG_getenv("ProcessEntireFile");
+           if (env == NULL) {
+              StrtAtEnd = TRUE;
+           }
+           else if (strcmp(env, "yes") != 0
+                        && strcmp(env, "YES") != 0) {
+              StrtAtEnd = TRUE;
+           }
+           if (Debug >= 2) {
+                    printf("FIRST PASS, StrtAtEnd=%d\n", StrtAtEnd);
+           }
+           if (StrtAtEnd == TRUE) {
+              oldlast = fseek(fp, lastplace, SEEK_END);
+           }
+           else {
+              oldlast = fseek(fp, lastplace, SEEK_SET);
+           }
+           firstpass = 0;
+        }
+        else {
+           oldlast = fseek(fp, lastplace, SEEK_SET);
+        }
+        while (fgets(InternalBuf[BufCt], 1024, fp) != NULL)
+        {
+            bp =     InternalBuf[BufCt];
+            BufCt++;
+ 
+            if (Debug >= 6) {
+               printf("BuildBuf(): entry='%s'\n", bp);
+            }
+            if (BufCt >= MAX_LINEBUF) {
+               break;
+            }
+        }
+        lastplace = ftell(fp);
+        fclose(fp);
+    }
+    else {
+        fprintf( stderr, "Couldn't open file %s\n", fname );
+    }
+ 
+}  /* End BuildBuf() */
+ 
+ 
+ 
+char *findComma(str)
+char *str;
+{
+    char *cp;
+ 
+    cp = str;
+    if (cp == NULL) {
+       return NULL;
+    }
+ 
+    if (Debug >= 4) {
+       printf("findComma(): Searching '%s'\n", cp);
+    }
+ 
+    for ( ; *cp != ',' && *cp != '\0'; cp++) {}
+ 
+    if (Debug >= 4) {
+       printf("findComma(): Found comma at '%s'\n", cp);
+    }
+ 
+    return cp;
+}
+ 
+ 
+int LdMsgCls()
+{
+    char  *brk1, *brk2;
+    char  *StrtFld2;            /* Start of the second field */
+    char   valbuf[255];
+    char   vn    [255];
+    int    vallen;
+    char  *ev; /* Environment buffer   */
+    int    cdi;                /* CodeDefinition index */
+    MsgClsDef  *CurMC;
+    MsgClsDef  *NewMC;
+ 
+    if (Debug >= 2) {
+           printf("LdMsgCls(): start\n");
+    }
+    MsgCls = CurMC = NULL;
+    cdi = 0;
+    while (TRUE) {
+ 
+            sprintf(vn, "CodeDefinition(%i)", cdi+1);
+            ev = TAG_getenv(vn);
+            if (ev == NULL) {
+               break;
+            }
+            if (Debug > 1) {
+               printf("LdMsgCls(): %d getenv returned '%s'\n",
+                      cdi + 1, ev);
+            }
+            cdi++;
+            NewMC = malloc(sizeof(MsgClsDef));
+            memset(NewMC, '\0', sizeof(MsgClsDef));
+            /*
+             *  Parse the line into the structure
+             */
+            brk1 = findComma(ev);
+            vallen = brk1 - ev;
+            memcpy(valbuf, ev, vallen);
+            valbuf[vallen] = '\0';
+            NewMC->MsgStr = strdup(valbuf);
+            NewMC->MsgLen = strlen(valbuf);
+ 
+               /* Find the brk between severity and class */
+            StrtFld2 = (*brk1 == '\0') ? brk1 : (brk1 + 1);
+            brk2 = findComma(StrtFld2);
+            vallen = brk2 - StrtFld2;
+            memcpy(valbuf, StrtFld2, vallen);
+            valbuf[vallen] = '\0';
+            NewMC->Severity = strdup(valbuf);
+            if (*brk2 == '\0') {
+               NewMC->Class = strdup("MVS_BASE");
+            }
+            else {
+               NewMC->Class = strdup(brk2+1);
+            }
+            /*
+             *  Add the record to the chain
+             */
+            NewMC->Next = NULL;
+            if (CurMC == NULL) {
+               CurMC = NewMC;
+               MsgCls = CurMC;
+            }
+            else {
+               CurMC->Next = NewMC;
+               CurMC = NewMC;
+            }
+     }
+ 
+     if (Debug > 1) {
+        printf("LdMsgCls(): exit; cdi=%d\n", cdi);
+        for (CurMC = MsgCls; CurMC != NULL; CurMC = CurMC->Next) {
+              printf("Msg: %s\n", CurMC->MsgStr);
+              printf("Sev: %s;  \tClass: %s\n",
+                      CurMC->Severity, CurMC->Class);
+        }
+     }
+     return;
+}
+ 
+ 
+ProcSprintEvtFile(handle, fname)
+    THND_t          handle;
+    char           *fname;
+{
+    int             n;                  /* Counter into buffer      */
+    char           *ibuffer;            /* actual message from file */
+                                        /*  goes here               */
+    char            obuffer[1024];      /* event string sent to     */
+                                        /* T/EC                     */
+    static char     last_date[7];       /* date of last event sent  */
+                                        /* (from log)               */
+    static char     last_time[15];      /* time of last event sent  */
+                                        /* (from log)               */
+    static int      first_time = 1;
+    static char     hostid[120];
+    static char   * event_strings[] = {  "MVS_Task_Up",
+                                         "MVS_Task_Down",
+                                         "MVS_Task_Failed",
+                                         "MVS_Pool_Status",
+                                         "MVS_Other"
+                                       };
+    static char   * possible_msg_id[]={
+                        MVS_TASK_UP,    /* UP          */
+                        MVS_TASK_DOWN,  /* DOWN        */
+                        MVS_TASK_FAILED,/* FAILED      */
+                        MVS_POOL_STATUS,/* Pool Status */
+                        "N/A"           /* Other       */
+                                      };
+ 
+ 
+    /* fields from the message that will be used by T/EC            */
+ 
+    char            host_id[20];/* host name                        */
+    char            cpu_id[9];  /* cpu_id field from log file       */
+    char            date[6];    /* raw date and time string         */
+    char            time[12];   /* raw date and time string         */
+    char            msg_id[8];  /* 7 character message ID           */
+    char            jobnumber[8];  /* 7 character message ID        */
+    char            jobname[20]; /* application id?                  */
+    char            event[128];  /* text of message to be passed on  */
+    char          * cptr;
+ 
+    int             rval;
+    int             msg_index;
+ 
+    if (Debug >= 2) {
+       printf("ProcSprintEvtFile(): fname=%s\n", fname);
+    }
+ 
+    if ( first_time ){
+        strcpy( last_date, "000000" );
+        strcpy( last_time, "00:00:00.00" );
+#if 1 == 0
+        if ( gethostname( hostid, 128 ) == -1 )
+            strcpy( host_id, "UNKNOWN Host!" );
+#endif
+        LdMsgCls();
+        first_time=0;
+    }
+ 
+    memset(date, '\0', 6 );
+    memset(time, '\0', 12);
+ 
+    BuildBuf(fname);
+    while ( BufCt > 0 )
+    {
+        MsgClsDef *CurMC = NULL;
+        char      *evtcp = NULL;
+        int        evtlen;
+        int        remlen;
+        int        success;
+        int        cmpstat;
+ 
+        for (n=0 ; n < BufCt; n++)
+        {
+            CurMC = MsgCls;
+            ibuffer = InternalBuf[n];
+            if (Debug > 5) {
+               printf("ProcSprintEvtFile(): entry='%s'\n",
+                     ibuffer);
+            }
+ 
+            /* clear out all carriage returns */
+            for ( cptr=ibuffer; *cptr != '\0'; cptr++) {
+                if (*cptr == '\n') {
+                    *cptr=' ';
+                }
+            }
+ 
+            /*
+             *  Parse the buffer against the code definition list
+             */
+            evtlen = strlen(ibuffer);
+            remlen = evtlen;
+            success = FALSE;
+ 
+            for ( CurMC = MsgCls; CurMC != NULL; CurMC = CurMC->Next)
+            {
+               evtcp = ibuffer;
+               remlen = evtlen;
+               for (; remlen >= CurMC->MsgLen  &&  success == FALSE;
+                      evtcp++, remlen--) {
+                  cmpstat = memcmp(CurMC->MsgStr, evtcp, CurMC->MsgLen);
+                  if (cmpstat == 0) {
+                     success = TRUE;
+                  }
+               }
+               if (success == TRUE) break;
+            }
+ 
+            if (success == TRUE) {
+               sprintf( obuffer,
+                 "%s;\n\tsource='MVS';\n\tseverity='%s';\n\tmsg='%s'",
+                        CurMC->Class, CurMC->Severity, ibuffer);
+            }
+            else {
+               sprintf( obuffer,
+                        "MVS_BASE;\n\tsource='MVS';\n\tmsg='%s'",
+                        ibuffer);
+            }
+            end_msg(obuffer);
+ 
+            rval=tec_put_event( handle, obuffer );
+        }
+        BuildBuf(fname);
+    }
+ 
+    if (Debug >= 2) {
+       printf("ProcSprintEvtFile(): Exiting\n");
+    }
+ 
+    return( 0 );
+ 
+} /* End ProcSprintEvtFile */
+ 
+ 
+ 
+ 
+/*
+ *------------------------------------------------------
+ * Translate ebcdic codes to ascii.  Oh and don't
+ * forget to translate the headers for the messages
+ * being sent in the function do_send() below!  It
+ * is vital!!!!!!
+ *------------------------------------------------------
+ */
+ 
+int ebcdic_to_ascii( c_in )
+register int c_in;
+{
+    static unsigned char ebcdic_in[256]= {
+        0, /* 0 */
+        32, 32, 32, 32, 9, 32, 32, 32, 32, 32,
+        32, 32, 13, 32, 32, 32, 32, 32, 32, 32,
+        32, 32, 32, 32, 32, 32, 32, 32, 32, 32,
+        32, 32, 32, 32, 32, 32, 10, 32, 32, 32,
+        32, 32, 32, 32, 32, 32, 32, 32, 32, 32,
+        32, 32, 32, 32, 32, 32, 32, 32, 32, 32,
+        32, 32, 32, 32, 32, 32, 32, 32, 32, 32,
+        32, 32, 32, 32, 46, 60, 40, 43, 32, 38,
+        32, 32, 32, 32, 32, 32, 32, 32, 32, 33,
+        36, 42, 41, 59, 126, 45, 47, 32, 32, 32,
+        32, 32, 32, 32, 32, 32, 44, 37, 95, 62,
+        63, 32, 32, 32, 32, 32, 32, 32, 32, 32,
+        96, 58, 35, 64, 39, 61, 34, 32, 97, 98,
+        99, 100, 101, 102, 103, 104, 105, 32, 32, 32,
+        32, 32, 32, 32, 106, 107, 108, 109, 110, 111,
+        112, 113, 114, 94, 32, 32, 32, 32, 32, 32,
+        32, 115, 116, 117, 118, 119, 120, 121, 122, 32,
+        32, 32, 32, 32, 32, 32, 32, 32, 32, 32,
+        32, 32, 32, 32, 32, 32, 32, 32, 32, 32,
+        32, 32, 65, 66, 67, 68, 69, 70, 71, 72,
+        73, 32, 32, 32, 32, 32, 32, 32, 74, 75,
+        76, 77, 78, 79, 80, 81, 82, 32, 32, 32,
+        32, 32, 32, 92, 32, 83, 84, 85, 86, 87,
+        88, 89, 90, 32, 32, 32, 32, 32, 32, 48,
+        49, 50, 51, 52, 53, 54, 55, 56, 57, 32,
+        32, 32, 32, 32, 32
+    };
+ 
+    return( ebcdic_in[ c_in ] );
+}
+ 
+ 
+/*
+ * __________________________________________
+ * the strdup function is not supported under
+ * MVS but is simple to code up!
+ * __________________________________________
+ */
+ 
+char * strdup( str )
+char * str;
+{
+    char * tmp;
+    int    strsz = strlen(str) + 1; /* Add 1 for null terminator */
+ 
+    strsz += (strsz % 2); /* Make string and even length */
+ 
+    tmp=(char*) malloc( strsz );
+    if ( tmp != NULL )
+        memset(tmp, '\0', strsz);  /* Make sure everything starts nul*/
+        strcpy( tmp, str );
+ 
+    return ( tmp );
+}
+ 
+/*
+ *
+ * BEGIN EIF LIBRARY!!!!!!!
+ *
+ * Below is the MVS version of the EIF Library
+ *
+ * the Majority of the changes were done for the
+ * following reasons:
+ *
+ *    * code must fit in 72 columns
+ *    * integer functions should not return NULL
+ *      values! and types should always match
+ *      because MVS' C-compiler flags these as
+ *      errors!
+ *    * It was considerably easier to work on
+ *      on the code in one big file under MVS
+ *      as they have no make facility and setting
+ *      up batch jobs is not a trivial endeavor
+ *    * functions like sleep() and certain error
+ *      return values are not supported - nor are
+ *      many signal values.
+ *
+ *    * This is also pretty much a K&R compiler and
+ *      doesn't support prototyping very well.
+ *
+ */
+ 
+ 
+/*
+ * Component Name: EIF
+ *
+ * $Date:$
+ *
+ * $Source:$
+ *
+ * $Revision:$
+ *
+ * Description: TEC agent communication library for non-TME agents
+ *
+ * (C) COPYRIGHT TIVOLI Systems, Inc. 1994 Unpublished Work All
+ * Rights Reserved Licensed Material
+ * - Property of TIVOLI Systems, Inc.
+ */
+ 
+typedef struct
+{
+    char           *keyword;
+    char           *value;
+}               TENV_t;
+ 
+/* data structure used for storing slot value for filtering */
+typedef struct
+{
+    char           *name;
+    char           *value;
+}               ev_slot;
+ 
+typedef struct
+{
+    char           *location;   /* host name of TEC server */
+    long            ip_addr;    /* TEC server IP address */
+    tec_delivery    type;       /* connection-less or
+                                 * connection-oriented */
+    IPCH_p_t        ipch;       /* IPC handle for sending events */
+    unsigned short  port;       /* port number to connect to */
+    int             oneway;     /* ignored for now */
+    int             test_mode;  /* using test mode? */
+    FILE           *test_out;   /* output stream for test mode */
+}               THND_s_t;
+ 
+/*
+ * this list of filters is a slist of slists.  Each slist in the
+ * slist is a list of ev_slots.  Got that?
+ */
+static SL_t    *TEVT_filters = NULL;
+static SL_t    *TENV_list = NULL;
+static SL_t    *evt_buffer_tbl = NULL;
+ 
+int             in_flush_events = 0;
+static int pipe_broken = 0;
+ 
+/* internal structure for a non-TME TEC handle */
+int             tec_errno = 0;
+ 
+/* number of seconds to try to re-establish a dropped connection */
+#define RETRY_INTERVAL        120
+#define FILE_LEN        256
+ 
+void fatal_memory_error();
+void TENV_delete();
+int TENV_search();
+int tec_add_filter();
+/* callback functions for filter list */
+int TFLT_walk();
+void TFLT_delete();
+void TEVT_delete();
+void ipc_destroy_handle( );
+IPCH_p_t ipc_create_remote_client();
+void ipc_shutdown();
+ 
+int tec_buffer_event( message )
+char * message;
+{
+    char           *env = NULL,
+                   *event;
+    int             limit = -1,
+                    num_events,
+                    i;
+    SL_t           *evt_tbl_cpy;
+ 
+/* return if BufferEvents was specified, but is not yes or YES */
+    if ((env = TAG_getenv("BufferEvents")) != NULL)
+    {
+        if (strcmp(env, "yes") != 0 && strcmp(env, "YES") != 0)
+        {
+            return (-1);
+        }
+    }
+/*
+ * Retrieve the value for BufferEventsLimit.  If it is not specified,
+ * then we will use -1 to indicate no limit
+ */
+    if ((env = TAG_getenv("BufferEventsLimit")) != NULL)
+    {
+        if (isdigit(*env))
+            limit = atoi(env);
+    }
+    if (!evt_buffer_tbl)
+    {
+        if (!(evt_buffer_tbl = SL_Create()))
+            fatal_memory_error();
+    }
+/*
+ * if limit != -1, then we need to check on the number of buffered
+ * events
+ */
+    if (limit != -1)
+    {
+    /*
+     * if the number of buffered events is more than we are supposed
+     * to buffer, then we need to remove some.
+     */
+        num_events = SL_NbrElm(evt_buffer_tbl);
+        if (num_events >= limit)
+        {
+            if (!(evt_tbl_cpy = SL_Create()))
+                fatal_memory_error();
+ 
+        /*
+         * Remove the first ones over the limit and free the memory.
+         * These events are lost forever
+         */
+            for (i = 0; i < num_events - limit + 1; i++)
+            {
+                event = (char *) SL_GetPos(evt_buffer_tbl, i);
+                free(event);
+            }
+ 
+        /*
+         * for limit - 1 events, extract from the original list and
+         * add them to the new list
+         */
+            for (i = num_events - limit + 1; i < num_events; i++)
+            {
+                event = (char *) SL_GetPos(evt_buffer_tbl, i);
+                if (!SL_InsLast(evt_tbl_cpy, (void *) event))
+                    fatal_memory_error();
+            }
+ 
+        /* free everything in the original list */
+            free(evt_buffer_tbl->list);
+            free(evt_buffer_tbl);
+ 
+        /* save the new list as the original */
+            evt_buffer_tbl = evt_tbl_cpy;
+        }
+    }
+    event = strdup(message);
+ 
+/* insert the new message in the buffer table */
+    if (!SL_InsLast(evt_buffer_tbl, (void *) event))
+        fatal_memory_error();
+ 
+    return (strlen(message));
+}                  /* tec_buffer_event */
+ 
+ 
+int
+tec_free_func(ptr)
+void * ptr;
+{
+    if (ptr)
+        free(ptr);
+}
+ 
+int tec_flush_events(handle)
+THND_t handle;
+{
+    char           *env = NULL,
+                   *event;
+    int             rate = 0,
+                    num_events,
+                    sent=0,
+                    i;
+    SL_t           *evt_tbl_cpy;
+ 
+    /*
+     * if an event buffer table has not been initialized, then return
+     */
+    if (!evt_buffer_tbl)
+        return (0);
+ 
+    in_flush_events = 1;
+ 
+    /*
+     * Retrieve the value for BufferFlushRate.  If it is not specified,
+     * then we will use 0 which means don't wait at all
+     */
+    if ((env = TAG_getenv("BufferFlushRate")) != NULL)
+    {
+        if (isdigit(*env))
+            rate = atoi(env);
+    }
+    /* create a SL to copy evt_buffer_tbl into */
+    if (!(evt_tbl_cpy = SL_Create()))
+        fatal_memory_error();
+ 
+    /* copy each event from evt_buffer_tbl to evt_tbl_cpy */
+    num_events = SL_NbrElm(evt_buffer_tbl);
+    for (i = 0; i < num_events; i++)
+    {
+        event = (char *) SL_GetPos(evt_buffer_tbl, i);
+        if (!SL_InsLast(evt_tbl_cpy, (void *) event))
+            fatal_memory_error();
+    }
+ 
+    /*
+     * free the evt_buffer_tbl - don't use SL_DelAll() because all
+     * of the elements are actually in the copy right now so we
+     * don't want to free them
+     */
+    free(evt_buffer_tbl->list);
+    free(evt_buffer_tbl);
+    evt_buffer_tbl = NULL;
+ 
+    /*
+     * for each of the events in the copied table, try to send it again.
+     * If it won't go, then it wil get put back on the original
+     * evt_buffer_tbl by tec_buffer_event()
+     */
+    for (i = 0; i < num_events; i++)
+    {
+        event = (char *) SL_GetPos(evt_tbl_cpy, i);
+        if (tec_put_event(handle, event) > 0)
+            sent++;
+        /*
+         * If rate is defined, and we have sent 'rate' events, sleep for
+         * a minute.  This defines rate events/minute even though they
+         * are sent in bursts
+         */
+        if (rate && !(i % rate))
+            system("wait 60" );
+    }
+ 
+/*
+ * Since we are now done with all of these events, free them. The
+ * events either got sent, or they got put back on the evt_buffer_tbl
+ * by tec_buffer_event()
+ */
+    SL_DelAll(evt_tbl_cpy, tec_free_func);
+ 
+    in_flush_events = 0;
+ 
+    return (sent);
+}                  /* tec_flush_event */
+ 
+void
+fatal_memory_error()
+{
+    fprintf(stderr, "Memory allocation failure, exiting...\n");
+    exit(1);
+}
+ 
+ 
+/*
+ * Purpose: initialization for TEC agent
+ *
+ * Description:
+ *
+ * Returns:
+ *
+ * Notes/Dependencies:
+ */
+ 
+int
+common_agent_init(cfgfile)
+char * cfgfile;
+{
+    FILE           *fp;
+    char            workbuf[512];
+    char            keyword[512];
+    char            value[512];
+    TENV_t         *entry;
+    int             j;
+    char            cfg_file[FILE_LEN];
+#ifndef __SASC__
+    static char default_cfg[] = "/etc/Tivoli/tecad_eif.conf";
+#else
+    static char default_cfg[] = CONFIGFILE;
+#endif
+    int             line_no = 1;
+#ifndef __SASC__
+#ifndef MVS
+    struct stat     sbuf;
+#endif
+#endif
+ 
+    if (Debug >= 2) {
+       printf("common_agent_init(): start init sequence \n");
+    }
+ 
+/* initialize the env list and the filter list */
+    if (TENV_list != NULL)
+    {
+        SL_DelAll(TENV_list, TENV_delete);
+    }
+    if (TEVT_filters != NULL)
+    {
+        SL_DelAll(TEVT_filters, TFLT_delete);
+    }
+    if ((TENV_list = SL_Create()) == NULL)
+    {
+        fatal_memory_error();
+    }
+/* create structured list to store filters */
+    if ((TEVT_filters = SL_Create()) == NULL)
+    {
+        fatal_memory_error();
+    }
+ 
+    if (Debug >= 2) {
+       printf("common_agent_init(): start processing config file %s\n",
+              cfgfile == NULL ? default_cfg: cfgfile);
+    }
+ 
+    if (cfgfile == NULL)
+    {
+        strcpy(cfg_file, default_cfg);
+    }
+    else 
+    {
+        strcpy( cfg_file, cfgfile );
+    }
+ 
+/* Open the given configuration file */
+    fp = fopen(cfg_file, "r");
+    if (!fp)
+    {
+    /* fopen trouble */
+        printf("%s: Can not fopen\n", cfg_file);
+        perror( "MVS open failed" );
+        return (4);
+    }
+    if (Debug >= 3) {
+       printf("common_agent_init(): config file opened\n");
+    }
+ 
+/* Process file lines */
+    while (fgets((char *) workbuf, 512, fp))
+    {
+       if (Debug >= 3) {
+          printf("common_agent_init(): cfg line '%s'\n", workbuf);
+       } 
+ 
+    /* Lines begining with '#' are comments */
+        if ((workbuf[0] == '#') || (workbuf[0] == '\n'))
+        {
+            line_no++;
+            continue;
+        }
+    /* forget the \n */
+        workbuf[strlen(workbuf) - 1] = '\0';
+ 
+    /* check if this is a filter specification */
+        if (strncmp(workbuf, FILTER, strlen(FILTER)) == 0)
+        {
+            if (tec_add_filter(workbuf + strlen(FILTER)) < 0)
+            {
+printf("syntax error in configuration file, line %d ignored\n",
+                       line_no);
+            }
+            line_no++;
+            continue;
+        }
+    /* parse input line */
+        strcpy(keyword, "");
+        strcpy(value, "");
+        j = sscanf(workbuf, "%[^=] = %s", keyword, value);
+        if (Debug >= 3) {
+          printf("common_agent_init(): Parse working with val '%s'\n",
+                 value);
+        }
+        if (j != 2)
+        {
+        /* sscanf trouble or blank line */
+printf("syntax error in configuration file, line %d ignored\n",
+                   line_no);
+            line_no++;
+            continue;
+        }
+ 
+        /* Handle special case for CodeDefinition lines */
+        {
+           static char *CDKW = "CodeDefinition";
+           int          cdl = strlen(CDKW);
+           char        *asgop;
+ 
+           if (strncmp(CDKW, keyword, cdl) == 0) {
+              /* Find = operator in string */
+              asgop = strchr(workbuf, '=');
+              strcpy(value, asgop+1);
+              if (Debug >= 3) {
+                 printf(
+                    "common_agent_init(): CD Line, val is now '%s'\n",
+                    value);
+              }
+           }
+        }
+    /* create value list entry */
+        if ((entry =
+             (TENV_t *) malloc(sizeof(TENV_t))) == NULL)
+        {
+            fatal_memory_error();
+        }
+    /* create entry keyword */
+        if ((entry->keyword = strdup(keyword)) == NULL)
+        {
+            fatal_memory_error();
+        }
+    /* create entry value */
+        if ((entry->value = strdup(value)) == NULL)
+        {
+            fatal_memory_error();
+        }
+    /* insert entry in list */
+        if (SL_InsLast(TENV_list, (void *) entry) == FALSE)
+        {
+            fatal_memory_error();
+        }
+        line_no++;
+    }
+ 
+    if (Debug >= 2) {
+       printf("common_agent_init(): closing cfg file \n");
+    }
+ 
+    fclose(fp);
+    return (0);
+}
+ 
+void
+TENV_delete(item)
+TENV_t * item;
+{
+    if (item)
+    {
+        if (Debug >= 1) {
+           printf("TENV_delete(): item=%ld, i->kw=%ld, i->v=%ld\n",
+                  (long)item, (long)item->keyword,
+                  (long)item->value);
+         }
+ 
+        if (item->keyword)
+            free(item->keyword);
+        if (item->value)
+            free(item->value);
+        free(item);
+    }
+}
+ 
+ 
+char  * TAG_getenv(keyword)
+char * keyword;
+{
+    TENV_t         *found;
+ 
+    found = (TENV_t *) SL_Find(TENV_list, keyword,
+                                                TENV_search);
+    if (found != NULL)
+        return (found->value);
+    else 
+        return (NULL);
+}
+ 
+ 
+int
+TENV_search(item, keyword)
+TENV_t * item;
+char * keyword;
+{
+    if ((item != NULL) &&
+        (item->keyword != NULL))
+    {
+        if (strcmp(keyword, item->keyword))
+            return (FALSE);
+        else
+            return (TRUE);
+    } else
+        return (FALSE);
+}
+ 
+ 
+ 
+/*
+ * Purpose: add an event filter to the list of filters
+ *
+ * Description:
+ *
+ * Returns: -1 on parse error
+ *
+ * Notes/Dependencies:
+ */
+ 
+int
+tec_add_filter(line)
+char *line;
+{
+    ev_slot        *ep;
+    SL_t           *filter;
+    char           *s;
+ 
+    if ((filter = SL_Create()) == NULL)
+    {
+        fatal_memory_error();
+    }
+/*
+ * parse the input line, putting each slot-value pair into the slot
+ * list
+ */
+    s = strtok(line, "=");
+    while (s != NULL)
+    {
+        if ((ep = (ev_slot *) malloc(sizeof *ep)) == NULL)
+        {
+            fatal_memory_error();
+        }
+        ep->name = strdup(s);
+        s = strtok(NULL, ";");
+        if (s == NULL)
+        {
+            return (-1);
+        }
+        ep->value = strdup(s);
+        if (SL_InsLast(filter, (void *) ep) == FALSE)
+        {
+            fatal_memory_error();
+        }
+        s = strtok(NULL, "=");
+    }
+ 
+/* filter completed.  Now put the filter into the filter list */
+    if (SL_NbrElm(filter) > 0)
+    {
+        if (SL_InsLast(TEVT_filters, (void *) filter) == 0)
+        {
+            fatal_memory_error();
+        }
+    }
+    return (0);
+}
+ 
+ 
+ 
+int
+TFLT_event(message)
+char * message;
+{
+    SL_t           *event;
+    ev_slot        *ep;
+    char           *msg,
+                   *s;
+    int             ret;        /* return value */
+ 
+    if (Debug >= 3) {
+       printf("TFLT_event(): msg='%s'\n", message);
+    }
+ 
+/* convert the event into an SL_t */
+    if ((event = SL_Create()) == NULL)
+    {
+        printf("memory allocation failure\n");
+        exit(1);
+    }
+    msg = strdup(message);
+ 
+/* get class */
+    if ((s = strtok(msg, ";")) == NULL)
+    {
+        free(msg);
+        SL_DelAll(event, TEVT_delete);
+        return (0);
+    }
+    if ((ep = (ev_slot *) malloc(sizeof *ep)) == NULL)
+    {
+        fatal_memory_error();
+    }
+    ep->name = strdup("Class");
+    ep->value = s;
+    if (SL_InsLast(event, (void *) ep) == 0)
+    {
+        fatal_memory_error();
+    }
+/* begin loop for other slots */
+    while ((s = strtok(NULL, "=")) != NULL)
+    {
+        if (strcmp(s, TECAD_EVENT_DELIMITER) == 0)
+        {
+            break;
+        }
+        if ((ep = (ev_slot *) malloc(sizeof *ep)) == NULL)
+        {
+            fatal_memory_error();
+        }
+        ep->name = s;
+        if ((s = strtok(NULL, ";")) == NULL)
+        {
+            SL_DelAll(event, TEVT_delete);
+            free(msg);
+            free(ep);
+            return (0);
+        }
+        ep->value = s;
+ 
+        if (SL_InsLast(event, (void *) ep) == 0)
+        {
+            fatal_memory_error();
+        }
+    }
+ 
+/*
+ * now begin filtering process.  Walk the filter list.  If a
+ * successful match is found, it will return TRUE
+ */
+    ret = SL_Walk2(TEVT_filters, TFLT_walk, event);
+ 
+/* clean up */
+    SL_DelAll(event, TEVT_delete);
+    free(msg);
+ 
+    if (Debug >= 2) {
+       printf("TFLT_event(): ret=%ld\n", (long)ret);
+    }
+ 
+    return (ret);
+}
+ 
+ 
+ 
+int
+TFLT_walk(filter, event)
+SL_t * filter;
+SL_t * event;
+{
+    int             i = 0;
+    int             j = 0;
+    ev_slot        *ep; /* one slot from the filter */
+    ev_slot        *evp;        /* one slot from the event */
+    int             match;
+ 
+    if (Debug >= 4) {
+       printf("TFLT_walk(): \n");
+    }
+ 
+/*
+ * a match must be found for EVERY slot before we
+ * return 0 (success)
+*/
+    while ((ep = (ev_slot*) SL_GetPos(filter, i++)) != NULL)
+    {
+ 
+    /*
+     * Look for a match for this filter slot.  If a matched slot is
+     * found, AND the values match, keep going
+     */
+        match = FALSE;
+        j = 0;
+        while ((evp = (ev_slot*) SL_GetPos(event, j++)) != NULL)
+        {
+            if (Debug > 5) {
+               printf("TFLT_walk(): compare1 '%s' to '%s'\n",
+                      ep->name, evp->name);
+               printf("TFLT_walk(): compare2 '%s' to '%s'\n",
+                      ep->value, evp->value);
+            }
+ 
+            if (strcmp(ep->name, evp->name) == 0)
+            {
+                match = (strcmp(ep->value, evp->value) == 0) ?
+                                TRUE : FALSE;
+                break;
+            }
+        }
+    /* if no match on this slot, return */
+        if (!match)
+        {
+            return (1);
+        }
+    }
+ 
+/*
+ * if we get to here, all slots matched, in which case the event
+ * should be filtered out.
+ */
+    return (0);
+}
+ 
+ 
+void
+TFLT_slot_delete(ep)
+ev_slot *ep;
+{
+    if (ep->name)
+    {
+        free(ep->name);
+    }
+    if (ep->value)
+    {
+        free(ep->value);
+    }
+    free(ep);
+}
+ 
+ 
+ 
+void
+TFLT_delete(filter)
+SL_t * filter;
+{
+    SL_DelAll(filter, TFLT_slot_delete);
+}
+ 
+ 
+void
+TEVT_delete(ep)
+ev_slot * ep;
+{
+    free(ep);
+}
+ 
+/*
+ * Purpose: Acquire the port the T/EC Server is listening to
+ *
+ * Description: Uses portmapper to locate the server port.
+ *
+ * Returns: Port Numver
+ *
+ * Notes/Dependencies:
+ */
+unsigned short tec_get_port(ip_addr)
+long ip_addr;
+{
+    struct rpcent  *rpcinfo=NULL;
+    struct sockaddr_in addr;
+    u_long          prognum;
+    unsigned short  port=0;       /* optional port ID */
+    char * temp;
+ 
+/*
+ * connect to server via portmapper.  First get rcp program number
+ * being used by the TEC server
+ */
+    prognum =  TEC_SERVER_NUMBER;
+ 
+    memset((char*)&addr, '\0', sizeof(struct sockaddr_in));
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = ip_addr;
+    addr.sin_port = port;
+ 
+    if (Debug >= 2) {
+       printf("tec_get_port(): execute pmap_getport() call\n");
+    }
+ 
+    port = pmap_getport(&addr, prognum, TEC_VERSION_NUMBER,
+                                                IPPROTO_TCP);
+    if (port == 0)
+    {
+        tec_errno = E_SCALL;
+        return (0);
+    }
+ 
+    if (Debug >= 1) {
+       printf("tec_get_port(): returned port=%ld\n", (long)port);
+    }
+ 
+    return (htons(port));
+}
+ 
+ 
+/*
+ * Purpose: connect to the TEC server without requiring the TME
+ * framework
+ *
+ * Description: currently uses our IPC library. Uses portmapper to
+ * locate the server port.
+ *
+ * Returns: IPC handle
+ *
+ * Notes/Dependencies:
+ */
+ 
+THND_t
+tec_create_handle( location, s_port, oneway, type)
+char *location;         /* host name */
+ushort s_port;          /* optional s_port ID */
+int oneway;             /* ignored in this version */
+tec_delivery type;
+{                  /* connection( -oriented or -less ) */
+    THND_s_t *th; /* return value */
+    struct hostent *server_host;
+    long            ip_addr;
+    char           *env;
+ 
+    if (location == NULL)
+    {
+    /* Search for keyword 'ServerLocation' in agent config */
+        if ((location = TAG_getenv("ServerLocation")) == NULL)
+        {
+            tec_errno = E_HOST;
+            return (NULL);
+        }
+    }
+/* allocate a new handle */
+    th = (THND_s_t*) malloc(sizeof *th);
+ 
+/* check for test mode */
+    if (((env = TAG_getenv("TestMode")) != NULL) &&
+        ((strcmp(env, "yes") == 0) || (strcmp(env, "YES") == 0)))
+    {
+ 
+        if ((th->test_out = fopen("dd:TECDEBUG", "w")) == NULL)
+        {
+            free(th);
+            tec_errno = errno;
+            return (NULL);
+        }
+        th->location = strdup(location);
+        return ((THND_t) th);
+    }
+    if (Debug >= 1) {
+       printf("tec_create_handle(): get ip for host %s\n",
+              location);
+    }
+/* get the IP address of the server host */
+    if ((server_host = gethostbyname(location)) == NULL)
+    {
+        tec_errno = E_HOST;
+        return (NULL);
+    }
+    memcpy(&ip_addr, server_host->h_addr_list[0], sizeof ip_addr);
+ 
+    if (s_port == 0)
+    {
+    /* Search for keyword 'ServerPort' in agent config */
+        if ((env = TAG_getenv("ServerPort")) != NULL)
+        {
+            s_port = (unsigned short) atoi(env);
+        }
+    }
+/* if not found or 0 in config file, use s_portmapper */
+    if (s_port == 0)
+    {
+        s_port = tec_get_port(ip_addr);
+    }
+ 
+    if (type == use_default)
+    {
+    /* Use connection_less, except if CO found in config file */
+        type = connection_less;
+        if ((env = TAG_getenv("ConnectionMode")) != NULL)
+        {
+            if ((!strcmp(env, "co")) || (!strcmp(env, "CO")) ||
+                (!strcmp(env, "connection_oriented")))
+            {
+                type = connection_oriented;
+            }
+        }
+    }
+    if (Debug >= 1) {
+       printf("tec_create_handle(): Establish conn. to %s at %ld\n",
+              location, (long)s_port);
+    }
+ 
+/* fill THND_ */
+    th->location = strdup(location);
+    th->port = s_port;
+    th->oneway = oneway;
+    th->type = type;
+    th->ip_addr = ip_addr;
+    th->test_mode = FALSE;
+    th->test_out = NULL;
+ 
+/* if CO mode, create an IPC client */
+    if (type == connection_oriented)
+    {
+        if (Debug >= 1) {
+           printf("tec_create_handle(): Open conn. oriented handle\n");
+        }
+ 
+        th->ipch = (IPCH_p_t) ipc_create_remote_client(ip_addr,
+                                                s_port, &tec_errno);
+        if (th->ipch == NULL)
+        {
+            free(th);
+            th = NULL;
+        }
+        /* forget the broken pipe - since there is no such signal */
+    } else
+    {
+        if (Debug >= 1) {
+           printf("tec_create_handle(): Connectionless mode used\n");
+        }
+ 
+        th->ipch = NULL;
+    }
+    if (Debug >= 1) {
+       printf("tec_create_handle(): Exiting, th=%ld\n", (long)th);
+    }
+    return ((THND_t) th);
+}
+ 
+ 
+ 
+ 
+ 
+ 
+/*
+ * Purpose: send an event to the TEC server
+ *
+ * Description: non-TME version
+ *
+ * Returns: number of bytes written
+ *
+ * Notes/Dependencies:
+ */
+ 
+long
+tec_put_event(handle, message)
+THND_t handle;
+char * message;
+{
+    unsigned long   length;
+    THND_s_t *th;
+    THND_s_t *new;
+    char           *env;
+    extern int      in_flush_events; /* defined in evt_buffer.c */
+    int             loop;
+ 
+    if (Debug >= 1) {
+       printf("tec_put_event(): Put msg '%s'(l=%ld\n",
+                  message, (long)length);
+       fflush(stdout);
+    }
+/*
+/* check if event should be discarded due to filtering */
+    if (TFLT_event(message))
+    {
+        return (0);
+    }
+    th = (THND_s_t *) handle;
+    length = strlen(message);
+ 
+    if (Debug >= 3) {
+       printf("tec_put_event(): Passed filtering for msg '%s'(l=%ld\n",
+                  message, (long)length);
+    }
+/*
+ * if we are in test mode, then just dump the stuff to the output
+ * file and return
+ */
+    if (th->test_mode)
+    {
+        fwrite(message, sizeof(char), length, th->test_out);
+        putc('\n', th->test_out);
+        return (length);
+    }
+ 
+    if (th->type == connection_oriented) {
+ 
+        if (ipc_send(th->ipch, message, length, 0, 0,
+                                &tec_errno) == 0) {
+            if ( ! in_flush_events )
+                tec_flush_events(handle);
+            return(length);
+        }
+ 
+        loop =5;
+        while ( loop -- ) {
+            system( "wait 5" );
+            new = tec_create_handle(th->location, 0, th->oneway,
+                        th->type);
+ 
+            if (new != NULL) {
+                memcpy(th, new, sizeof *th);
+                free(new);
+                pipe_broken = 0;
+                break;
+            }
+ 
+        }
+ 
+        if ( ! pipe_broken ) {
+                /* if the send succeeds, then flush any buffered
+                   events and return */
+            if (ipc_send(th->ipch, message, length,
+                        0, 0, &tec_errno) == 0) {
+                if ( ! in_flush_events )
+                    tec_flush_events(handle);
+                return(length);
+            }
+        }
+    } else {
+ 
+        th->ipch = ipc_create_remote_client(th->ip_addr,
+                                th->port, &tec_errno);
+        if (th->ipch == NULL) {
+            th->port = tec_get_port(th->ip_addr);
+            if ( th->port != 0 ) {
+                th->ipch = ipc_create_remote_client(th->ip_addr,
+                                            th->port, &tec_errno);
+            }
+        }
+ 
+        if (Debug >= 3) {
+           printf("tec_put_event(): exec ipc_send for msg '%s'(l=%d\n",
+                  message, length);
+        }
+            /* if we finally got a connection, then send the data */
+        if (th->ipch != NULL) {
+            int rc;
+            rc = ipc_send(th->ipch, message, length, 0, 0,
+                                                &tec_errno);
+            if (Debug >= 1) {
+               printf("tec_put_event(): sent; rc=%ld, tec_errno=%ld\n",
+                      (long)rc, (long)tec_errno);
+            }
+            ipc_shutdown(th->ipch);
+            ipc_destroy_handle(th->ipch);
+            th->ipch = NULL;
+ 
+            if ( rc == 0 ) {
+                if ( ! in_flush_events )
+                    tec_flush_events(handle);
+                return(length);
+            }
+        }
+    }
+ 
+ 
+/*
+ * if we got here, then we have not sent the message to the Event
+ * Server, so we buffer it for sending later
+ */
+ 
+    return (tec_buffer_event(message));
+}
+ 
+ 
+ 
+ 
+ 
+ 
+/*
+ * Purpose: destroy TEC handle - non-TME version
+ *
+ * Description:
+ *
+ * Returns:
+ *
+ * Notes/Dependencies:
+ */
+ 
+void
+tec_destroy_handle(handle)
+THND_t handle;
+{
+    THND_s_t *th;
+ 
+    th = (THND_s_t *) handle;
+    tec_flush_events(th);
+    if (th->type == connection_oriented)
+    {
+        if (Debug >= 3) {
+           printf("tec_destroy_handle(): Destroying conn. oriented\n");
+        }
+        if (th->ipch)
+        {
+            ipc_shutdown(th->ipch);
+            ipc_destroy_handle(th->ipch);
+        }
+    }
+    free(th->location);
+    free(th);
+}
+ 
+/*
+ * Purpose: initialization for non-TME TEC agent
+ *
+ * Description:
+ *
+ * Returns:
+ *
+ * Notes/Dependencies:
+ */
+ 
+int
+TAG_init(cfgfile)
+char * cfgfile;
+{
+    return (common_agent_init(cfgfile));
+}
+ 
+ 
+ 
+/*
+ * Name: SL_Create
+ *
+ * Purpose: Create a Simple List handler.
+ *
+ * Input: /
+ *
+ * Ouput/Exceptions:
+ * Returns: return a handle for list manipulations or
+ * NULL if error.
+ *
+ */
+ 
+SL_t * SL_Create()
+{
+    SL_t           *ptr;
+ 
+    ptr = (SL_t *) malloc(sizeof(SL_t));
+    if (ptr == NULL)
+    {
+        return (NULL);
+    }
+    ptr->list = NULL;
+    ptr->nbr = 0;
+    ptr->last_pos = 0;
+    return (ptr);
+}
+ 
+int
+SL_InsLast(handle, elm)
+    SL_t           *handle;
+    void           *elm;
+{
+/* (re) allocate space */
+    if (handle == NULL)
+        return (FALSE);
+    if (handle->last_pos >= handle->nbr)
+    {
+        if (handle->nbr == 0)
+        {
+            handle->list = (void *)
+                        malloc(sizeof(void *) * BLOCK_SIZE);
+        } else
+        {
+            handle->list = (void *) realloc(handle->list,
+                       sizeof(void *) * (handle->nbr + BLOCK_SIZE));
+        }
+        if (handle->list == NULL)
+        {
+        /* SL_errno = MALLOC_ERROR */
+            return (FALSE);
+        }
+        handle->nbr += BLOCK_SIZE;
+    }
+    handle->list[handle->last_pos++] = elm;
+ 
+    return (TRUE);
+}
+ 
+void * SL_Find(handle, cmp_data, cmp_func)
+    SL_t           *handle;
+    void           *cmp_data;
+    int             (*cmp_func) ();
+{
+    int             i;
+    void          **list;
+ 
+    if ((handle == NULL) ||
+        (handle->nbr == 0) ||
+        (handle->last_pos == 0))
+    {
+    /* SL_errno = INVALID_STRUCTUR */
+        return (NULL);
+    }
+    if (cmp_func == NULL)
+    {
+    /* SL_errno = INCOMPATIBLE_PARAMETER */
+        return (NULL);
+    }
+    list = handle->list;
+    for (i = 0; i < handle->last_pos; i++)
+    {
+        if (cmp_func(list[i], cmp_data) == TRUE)
+            return (list[i]);
+    }
+    return (NULL);
+}
+ 
+void           *
+SL_GetPos(handle, pos)
+    SL_t           *handle;
+    int             pos;
+{
+    if ((handle == NULL) ||
+        (pos >= handle->last_pos))
+    {
+        return (NULL);
+    }
+    return (handle->list[pos]);
+}
+ 
+ 
+void
+SL_DelAll(handle, free_func)
+    SL_t           *handle;
+    void            (*free_func) ();
+{
+    int             i;
+ 
+    if (handle == NULL)
+    {
+        return;
+    }
+    if (handle->list != NULL)
+    {
+        for (i = 0; i < handle->last_pos; i++)
+        {
+            free_func(handle->list[i]);
+            handle->list[i] = NULL;
+        }
+        free(handle->list);
+        handle->list = NULL;
+    }
+    free(handle);
+    return;
+}
+ 
+int SL_Walk2(handle, func, arg)
+    SL_t           *handle;
+    int             (*func) ();
+    void           *arg;
+{
+    int             i,
+                    ret;
+    void          **list;
+ 
+    if (Debug >= 3) {
+       printf("SL_Walk2t(): \n");
+    }
+ 
+    if ((handle == NULL) ||
+        (handle->nbr == 0) ||
+        (handle->last_pos == 0))
+    {
+    /* SL_errno = INVALID_STRUCTUR */
+        return (FALSE);
+    }
+    if (func == NULL)
+    {
+    /* SL_errno = INCOMPATIBLE_PARAMETER */
+        return (FALSE);
+    }
+    list = handle->list;
+    for (i = 0; i < handle->last_pos; i++)
+    {
+        if ((ret = func(list[i], arg)) == 0)
+            return (TRUE);
+        else if (ret == -1)
+            return (FALSE);
+    }
+    return (FALSE);
+ 
+}  /* End SL_Walk2() */
+ 
+int
+SL_NbrElm(handle)
+SL_t           *handle;
+{
+    if (handle != NULL)
+        return (handle->last_pos);
+    else 
+        return (0);
+}
+ 
+ 
+ 
+ 
+ 
+IPCH_p_t 
+ipc_create_remote_client( addr, s_port, error )
+unsigned addr;
+unsigned short s_port;
+ipc_error_t * error;
+{
+    IPCH_p_t        handle;
+    struct sockaddr_in server;
+ 
+    handle = (IPCH_p_t) malloc(sizeof(IPCH_t));
+    if (Debug >= 3) {
+       printf("ipc_crc(): handle = %ld\n", (long)handle);
+    }
+ 
+    handle->fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (handle->fd < 0)
+    {
+        *error = E_SCALL;
+        return 0;
+    }
+    if (Debug >= 1) {
+       printf("ipc_crc(): handle->fd = %ld, port=%ld\n",
+              (long)handle->fd, (long)s_port);
+    }
+ 
+    memset((char *) &server, 0, sizeof(server));
+    server.sin_family = AF_INET;
+    server.sin_port = s_port;
+    server.sin_addr.s_addr = addr;
+    if (connect(handle->fd, (struct sockaddr *) & server,
+                sizeof(server)) < 0)
+    {
+        close( handle->fd );
+        free(handle);
+        perror( "Couldn't Connect" );
+        /* ror = errno == ECONNREFUSED ? E_IPC_BROKEN : E_SCALL; */
+        return 0;
+    }
+ 
+    return handle;
+}
+ 
+/*
+ * Description: graceful shutdown of communications
+ *
+ * Returns: void
+ *
+ * Notes/Dependencies:
+ */
+void
+ipc_shutdown(ipch)
+IPCH_p_t ipch;
+{
+    if (ipch->fd >= 0)
+    {
+        shutdown(ipch->fd, 2);
+    }
+}
+ 
+/*
+ * Description: close and free handle
+ *
+ * Returns: void
+ *
+ * Notes/Dependencies: input pointer is freed before return
+ */
+void
+ipc_destroy_handle( ipch )
+IPCH_p_t ipch;
+{
+    if (ipch->fd >= 0)
+    {
+        if (Debug >= 1) {
+           printf("ipc_destroy_handle(): ipch=%ld, ipch->fd=%ld\n",
+                  (long)ipch, (long)ipch->fd);
+        }
+        close(ipch->fd);
+    }
+    free(ipch);
+}
+ 
+/*
+ * Description: socket-level send function
+ *
+ * Returns: 0 for success, -1 for failure
+ *
+ * Notes/Dependencies:
+ */
+static int
+do_send( fd, buf, len, error )
+int fd;
+char *buf;
+int len; 
+ipc_error_t * error;
+{
+    int             rv;
+ 
+retry:
+    rv = send(fd, buf, len, 0);
+    if (rv < 0)
+    {
+        /* JCV As far as I can tell there is no
+           EINTR errno supported in MVS
+        */
+        *error = E_SCALL;
+        return -1;
+    }
+    if (rv < len)
+    {
+        len -= rv;
+        buf += rv;
+        goto retry;
+    }
+    return (0);
+}
+ 
+/*
+ * Description:  Send a message
+ *
+ * Returns: 0 for success, -1 for failure
+ *
+ * Notes/Dependencies:  Compatible message format with libtmf's and
+ * libwo's ipc_send.
+ */
+ 
+int
+ipc_send( handle, data, len, type, id, error )
+IPCH_p_t handle;
+char *data;
+long len;
+long type;
+long id; 
+ipc_error_t * error;
+{
+    IMH_t   hdr;
+    int             dlen;
+    int             slen;
+    char          * cptr;
+    int             x;
+    char          * hdrdata = NULL;
+    int             hdsz    = 0;
+ 
+    if (Debug >= 3) {
+       printf("ipc_send(): Start processing for msg '%s'(l=%d\n",
+              data, len);
+    }
+ 
+    memcpy(hdr.token, TOKEN, 8);
+    hdr.msg_id = htonl(id);
+    hdr.msg_from = htonl(0);
+    hdr.msg_to = htonl( 0 );
+    hdr.msg_type = htonl(type);
+    hdr.ipc_msg_type = htonl( 0 );
+    hdr.msg_len = htonl(len);
+    if (len < HDR_DATA_LEN) {
+        dlen = len;
+    }
+    else {
+        dlen = HDR_DATA_LEN;
+    }
+    hdsz = sizeof(hdr.hdr_data);
+    hdrdata = hdr.hdr_data;
+    memset(hdrdata, '\0', hdsz);
+ 
+    if ((hdr.hdr_dlen = htonl(dlen)) != 0) {
+        memcpy(hdrdata, data, dlen);
+    }
+    slen = sizeof(IMH_t) - HDR_DATA_LEN + dlen;
+ 
+/* translate EBCDIC to ASCII - I hope */
+    if (Debug >= 3) {
+       printf("ipc_send(): exec send for '%s' after transl\n",
+              hdrdata);
+       printf("ipc_send(): dlen=%d, slen=%d\n", dlen, slen);
+    }
+    for (x=0, cptr=(char*)hdr.token;x<8;cptr++, x ++)
+         * cptr= ebcdic_to_ascii( *cptr );
+    for (cptr=(char*)hdrdata;*cptr!='\001';cptr++)
+         * cptr= ebcdic_to_ascii( *cptr );
+ 
+    /* send the header (and data if it's short) */
+    if (do_send(handle->fd, (char *) &hdr, slen, error) != 0)
+    {
+        return -1;
+    }
+    /*
+     * send the rest of the message body (if it was longer than
+     * HDR_DATA_LEN
+     */
+    if (len - dlen > 0)
+    {
+        if (do_send(handle->fd, data + dlen, len - dlen, error) != 0)
+        {
+            return -1;
+        }
+    }
+    return 0;
+}
+ 
+ 
+ 
+ 
+/*
+ * Local version of the standard UNIX getopt function which is not
+ * available on MVS.  This has the major functionality
+ * but is not necessarily to the the "letter" of the man page
+ * definition in error handling.
+ */
+ 
+int   optind = 1;
+char *optarg;
+int   opterr, optopt;
+ 
+int getopt (int argc, char *argv[], char *optstring)
+{
+   char    next;
+   char    code;
+   char   *codeloc;
+   char    codequal;
+   char    third;
+ 
+   opterr = 0;
+   optarg = NULL;
+ 
+   if (optind >= argc) {
+      return (-1);
+   } /* endif */
+ 
+   next = argv[optind][0];
+   if ( next == '\0' || next != '-' ) {
+      return (-1);
+   } /* endif */
+ 
+   code = argv[optind][1];
+   if ( code == '\0' ) {
+      return (-1);
+   } /* endif */
+ 
+   codeloc = strchr(optstring, code);
+   if ( codeloc == NULL ) {
+      return ('?');
+   } /* endif */
+ 
+   codequal = *(codeloc + 1);
+   if (codequal != ':') {
+      optind++;
+      return (code);
+   } /* endif */
+ 
+   third = argv[optind][2];
+   if (third == '\0') {
+      if ( (optind + 1) >= argc) {
+          opterr = 1;
+          return('?');  /* No next argument */
+      } /* endif */
+      optarg = (char *)argv[optind+1];
+      optind += 2;
+   }
+   else {
+      optarg = (char *) &(argv[optind][2]);
+      optind += 1;
+   } /* endif */
+   return (code);
+ 
+}
+ 
+ 
+ 
+ 
+void print_usage_and_exit(argv)
+char **argv;
+{
+    fprintf(stderr,
+            "agent <-D debug> <-L config_file> <-P port_num> ");
+    fprintf(stderr,
+            "<-R severity> <-M Message> ");
+    fprintf(stderr,
+            "<slot=value...> Class Source\n");
+    exit(2);
+}
+ 
+ 
+ 
+ 
+int StressIt()
+{
+    THND_t          th;              /* create TEC handle        */
+    char            EvtBuf [1024];   /* path to config file */
+    int             tpestat;
+    int             n = 0;
+    long            count, count2;
+    static char    *CompDate = __DATE__;
+    static char    *CompTime = __TIME__;
+ 
+    printf("StressIt(): call tec_create_handle, loc.=%s,port=%ld\n",
+           location, (long)port);
+ 
+    if ((th = tec_create_handle(location, port,
+                        one_way, use_default )) == NULL) {
+            printf("Failure: tec_create_handle(%s,%d,%d, type))\n",
+                   location, port, one_way);
+            printf( "tec_errno:%d\n", tec_errno);
+            exit(1);
+    }
+    for (n = 10; n < 20; n++) {
+       sprintf(EvtBuf,
+           "MVS_Base;msg='#%X, Vers. Comp %s %s'",
+           n, CompDate, CompTime);
+       strcat(EvtBuf, ";severity=HARMLESS");
+       end_msg(EvtBuf);
+       printf("StressIt(): call tec_put_event '%s'\n", EvtBuf);
+       tpestat = tec_put_event( th, EvtBuf);
+       for (count2 = 0; count2 < 100; count2++)
+         for (count = 0; count < 10000; count++) {}/* Stall a little */
+    }
+ 
+    printf("StressI(): call tec_destroy_handle; tpestat=%d\n",
+           tpestat);
+    tec_destroy_handle(th);
+ 
+    printf("StressIt(): exit\n");
+    return (0);
+}
+ 
+ 
+ 
+ 
+int PostMsg()
+{
+    THND_t          th;              /* create TEC handle        */
+    int    tpestat = 0;
+ 
+    if (Debug >= 1) {
+     printf("PostMsg():call tec_create_handle, location=%s,port=%ld\n",
+           (location == NULL ? "<NULL>" : location),
+           (long)port);
+    }
+    if ((th = tec_create_handle(location, port,
+                        one_way, use_default )) == NULL) {
+       printf("Failure: tec_create_handle(%s,%d,%d, type))\n",
+                   location, port, one_way);
+       printf( "tec_errno:%d\n", tec_errno);
+       exit(1);
+    }
+    if (Debug) {
+       printf("PostMsg(): call tec_put_event '%s'\n", s);
+    }
+    end_msg(s);  /* Wait to here so cfg file is processed */
+    tpestat = tec_put_event( th, s);
+ 
+    if (Debug >= 1) {
+       printf("PostMsg(): call tec_destroy_handle; tpestat=%d\n",
+                 tpestat);
+    }
+    tec_destroy_handle(th);
+ 
+    if (Debug >= 1) {
+       printf("PostMsg(): exit\n");
+    }
+ 
+    return (tpestat <= 0);  /* Return non-zero if put error */
+}
+ 
+ 
+ 
+#ifdef __SASC__
+ 
+ 
+int FindStr(char *buf, char *ss)
+{
+   int    sslen = strlen(ss);
+   int    blen  = strlen(buf);
+   int    ncmp  = 0;
+   int    stat  = 0;
+   char  *lp = buf + blen - sslen + 2; /* define last pt to search */
+ 
+   char *sp = buf;
+ 
+   for (; sp < lp; sp++) {
+      ncmp = strncmp(sp, ss, sslen);
+      if (ncmp == 0) {
+         stat = 1;
+         break;
+      }
+   }
+ 
+   return stat;
+}
+ 
+#define ADAPHOST ";adapter_host="
+#define MONHOST  ";hostname="
+#define ADAPIP   ";origin="
+#define EVTDATE  ";date="
+int end_msg (char *msg)
+{
+    static int             FirstPass = 1;
+ 
+    int                    fndstat = 0;
+    static char            hostip[17];
+ 
+    time_t                 curtime;
+    char                   evtdate[25];
+    char                   tmpbuf[50];
+ 
+    struct in_addr         ipa;
+    struct hostent         *he;
+ 
+ 
+    curtime = time(NULL);
+    strcpy(evtdate, ctime(&curtime) + 4); /* Skip over day name to date */
+    evtdate[strlen(evtdate)-1] = '\0';
+ 
+    if ( FirstPass ) {
+       struct  in_addr *iaptr = NULL;
+ 
+       FirstPass = 0;
+       memset(hostip, '\0', sizeof(hostip));
+ 
+       if (MsgHostname[0] != '\0') {
+          he = gethostbyname(MsgHostname);
+          if (he != NULL) {
+             iaptr= (struct in_addr *) (he->h_addr_list [0]);
+             ipa.s_addr = iaptr->s_addr;
+             if (Debug >= 2) {
+               printf("end_msg(): he=%ld; iaptr=%ld; ipa.s_addr=%lx\n",
+                      (long)he, (long)iaptr, (long)ipa.s_addr);
+             }
+             strcpy(hostip, inet_ntoa(ipa));
+          }
+       } 
+       if (hostip[0] == '\0') { /* If still unset, init it */
+          strcpy(hostip, "UNAVAILABLE");
+       } 
+    }
+ 
+   if (Debug >= 3) {
+      printf("end_msg(): End msg '%s'\n", msg);
+   }
+ 
+   fndstat = FindStr(msg, ADAPHOST);
+   if (!fndstat) {
+      strcat(msg, ADAPHOST);
+      strcat(msg, MsgHostname);
+   }
+ 
+   fndstat = FindStr(msg, MONHOST);
+   if (!fndstat) {
+      strcat(msg, MONHOST);
+      strcat(msg, MsgHostname);
+   }
+ 
+   fndstat = FindStr(msg, ADAPIP);
+   if (!fndstat) {
+      strcat(msg, ADAPIP);
+      strcat(msg, hostip);
+   }
+ 
+   fndstat = FindStr(msg, EVTDATE);
+   if (!fndstat) {
+      sprintf(tmpbuf, "%s'%s'", EVTDATE, evtdate);
+      strcat(msg, tmpbuf);
+   }
+ 
+   strcat (msg, ";END\n\001" );
+ 
+   if (Debug >= 2) {
+      printf("end_msg(): Revised msg '%s'\n", msg);
+   }
+   return (0);
+}
+ 
+#endif
+ 
+ 
