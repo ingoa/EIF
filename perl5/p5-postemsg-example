@@ -1,0 +1,18 @@
+#!/usr/bin/perl
+use Postemsg;
+
+for ($i = 0;  $i < 5;  $i++) {
+
+    $msg = Postemsg->new("gforce");       # Set the server hostname
+    $msg->setClass("Root_Login_Success_From"); # Set a valid class name and
+    $msg->setAdapter("LOGFILE");          # Set a valid adapter name
+    $msg->setMessage("root login from tec$i");
+    $msg->setSlotValue("hostname","tec$i"); 
+    $msg->setSlotValue("origin","10.69.10.17");
+    $msg->sendMessage();                  #--- Sends the message to TEC
+    $msg->print();                        #---prints all slot values
+    sleep 2;
+
+}
+
+exit(0);

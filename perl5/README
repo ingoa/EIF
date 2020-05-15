@@ -1,0 +1,49 @@
+Postemsg Package
+
+Description:
+
+This package executes the tasks performed by Tivoli Systems
+postemsg executable in a platform independent manner. The
+various TEC message slots can be set with setter methods.
+The actual message is sent to TEC by first: performing an
+emulated RPC call to obtain the port where the TEC wants to
+talk and the setting up a TCP/IP connection to that port
+to transmit the data.  This nut was cracket by purusing
+AEF C code and sniffing the wire while using
+postemsg from the command line.
+
+Written by: Jim Boone, Duke Energy Corp.
+Date: May 18, 1998
+
+------------------------------------------------------------
+
+REQUIREMENTS
+
+    Perl 5
+
+INSTALLATION
+
+    Copy the Postemsg.pm Perl module to the location on your
+    system where Perl modules normally reside, for instance,
+    my Perl 5 installation keeps such files in /usr/libdata/perl/5.00503 :
+
+tec:/usr/libdata/perl/5.00503$ ls *pm
+AnyDBM_File.pm  DirHandle.pm    FindBin.pm      base.pm         overload.pm
+AutoLoader.pm   Dumpvalue.pm    Postemsg.pm     blib.pm         re.pm
+AutoSplit.pm    DynaLoader.pm   SelectSaver.pm  constant.pm     sigtrap.pm
+Benchmark.pm    English.pm      SelfLoader.pm   diagnostics.pm  strict.pm
+CGI.pm          Env.pm          Shell.pm        fields.pm       subs.pm
+CPAN.pm         Exporter.pm     Symbol.pm       integer.pm      vars.pm
+Carp.pm         Fatal.pm        Test.pm         less.pm
+Config.pm       FileCache.pm    UNIVERSAL.pm    lib.pm
+Cwd.pm          FileHandle.pm   autouse.pm      locale.pm
+
+IMPLEMENTATION
+
+This is a Perl module.  You will need to write your own Perl script to 
+drive it. 
+
+For a working example, see my p5-postemsg-example
+
+John Kirch
+jkirch@tivoli.com
